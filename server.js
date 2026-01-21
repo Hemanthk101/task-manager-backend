@@ -1,4 +1,3 @@
-// server.js
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -17,22 +16,22 @@ const allowedOrigins = (process.env.CORS_ORIGIN || "")
 
 const corsOptions = {
   origin: (origin, cb) => {
-    // allow requests like curl/postman (no origin header)
+    // allow curl/postman (no origin header)
     if (!origin) return cb(null, true);
 
-    // if CORS_ORIGIN not set, allow all (not recommended for prod)
+    // if CORS_ORIGIN not set, allow all (NOT recommended for prod)
     if (allowedOrigins.length === 0) return cb(null, true);
 
     if (allowedOrigins.includes(origin)) return cb(null, true);
     return cb(new Error("Not allowed by CORS: " + origin));
   },
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  methods: ["GET", "PUT", "POST", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
-  credentials: false, // ✅ keep false unless you really use cookies
+  credentials: false, // keep false unless you use cookies
 };
 
 app.use(cors(corsOptions));
-app.options("*", cors(corsOptions)); // ✅ THIS FIXES PREFLIGHT
+app.options("*", cors(corsOptions)); // ✅ fixes preflight
 
 // ---------- IST Helpers ----------
 function getISTDayKey() {
@@ -54,14 +53,12 @@ const AppStateSchema = new mongoose.Schema(
   {
     userId: { type: String, required: true, unique: true },
 
-    // stored state
     plannerTasks: { type: Array, default: [] },
     bodyTasks: { type: Array, default: [] },
     skinTasks: { type: Array, default: [] },
     skinSessions: { type: Number, default: 0 },
     mindSubjects: { type: Array, default: [] },
 
-    // reminders (optional)
     reminderSettings: {
       type: Object,
       default: { enabled: true, skinTime: "21:00", bodyTime: "19:00" },
@@ -69,15 +66,14 @@ const AppStateSchema = new mongoose.Schema(
     mindReminderTimes: { type: Object, default: {} },
     mindReminderEnabled: { type: Object, default: {} },
 
-    // reset tracking
     istDayKey: { type: String, default: "" },
   },
   { timestamps: true }
 );
 
-const AppState = mongoose.model("AppState", AppStateSchema);
+const AppState = mongoose.models.AppState || mongoose.model("AppState", AppStateSchema);
 
-// ---------- Defaults (same vibe as your app) ----------
+// ---------- Defaults ----------
 const defaultBodyTasks = [
   { id: 1, label: "Push ups", completed: false },
   { id: 2, label: "Pull ups", completed: false },
@@ -113,24 +109,21 @@ const defaultMindSubjects = [
   },
 ];
 
-// ---------- Daily Reset at 00:00 IST (server-side safety) ----------
+// ---------- Daily Reset ----------
 function applyISTDailyReset(doc) {
   const todayIST = getISTDayKey();
 
   if (doc.istDayKey !== todayIST) {
-    // reset body tasks
     doc.bodyTasks = (doc.bodyTasks?.length ? doc.bodyTasks : defaultBodyTasks).map((t) => ({
       ...t,
       completed: false,
     }));
 
-    // reset skin tasks (but keep skinSessions)
     doc.skinTasks = (doc.skinTasks?.length ? doc.skinTasks : defaultSkinTasks).map((t) => ({
       ...t,
       completed: false,
     }));
 
-    // reset mind unit checkboxes (keep subjects/links)
     doc.mindSubjects = (doc.mindSubjects?.length ? doc.mindSubjects : defaultMindSubjects).map((s) => ({
       ...s,
       units: (s.units || []).map((u) => ({ ...u, completed: false })),
@@ -141,12 +134,39 @@ function applyISTDailyReset(doc) {
   return doc;
 }
 
+// ---------- DB connect (cached for serverless) ----------
+let cached = globalThis.__MONGO_CONN__;
+if (!cached) cached = globalThis.__MONGO_CONN__ = { conn: null, promise: null };
+
+async function connectDb() {
+  const uri = process.env.MONGODB_URI;
+  if (!uri) throw new Error("Missing MONGODB_URI");
+
+  if (cached.conn) return cached.conn;
+
+  if (!cached.promise) {
+    cached.promise = mongoose.connect(uri).then((m) => m);
+  }
+
+  cached.conn = await cached.promise;
+  return cached.conn;
+}
+
 // ---------- Routes ----------
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    message: "Task Manager Backend is running",
+    endpoints: ["/health", "/api/state?userId=demo"],
+  });
+});
+
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// Get full state
 app.get("/api/state", async (req, res) => {
   try {
+    await connectDb();
+
     const userId = String(req.query.userId || "demo");
     let doc = await AppState.findOne({ userId });
 
@@ -171,19 +191,18 @@ app.get("/api/state", async (req, res) => {
   }
 });
 
-// Save full state (simplest approach)
 app.put("/api/state", async (req, res) => {
   try {
+    await connectDb();
+
     const userId = String(req.query.userId || "demo");
     const payload = req.body || {};
 
     let doc = await AppState.findOne({ userId });
     if (!doc) doc = new AppState({ userId });
 
-    // apply reset first to keep dayKey consistent
     doc = applyISTDailyReset(doc);
 
-    // overwrite allowed fields
     doc.plannerTasks = payload.plannerTasks ?? doc.plannerTasks;
     doc.bodyTasks = payload.bodyTasks ?? doc.bodyTasks;
     doc.skinTasks = payload.skinTasks ?? doc.skinTasks;
@@ -201,39 +220,24 @@ app.put("/api/state", async (req, res) => {
   }
 });
 
-// ---------- Connect (Vercel-safe) ----------
-let mongoReady = false;
+// ✅ STEP 2: Vercel serverless export + keep local run working
+const isVercel = !!process.env.VERCEL;
 
-async function ensureMongo() {
-  if (mongoReady) return;
-  const uri = process.env.MONGODB_URI;
-  if (!uri) throw new Error("Missing MONGODB_URI");
-
-  // Prevent multiple connects in serverless
-  if (mongoose.connection.readyState === 1) {
-    mongoReady = true;
-    return;
-  }
-
-  await mongoose.connect(uri);
-  mongoReady = true;
-  console.log("MongoDB connected");
+// Local run: npm start
+if (!isVercel) {
+  connectDb()
+    .then(() => {
+      const port = Number(process.env.PORT || 8080);
+      app.listen(port, () => console.log(`API running on :${port}`));
+    })
+    .catch((e) => {
+      console.error(e);
+      process.exit(1);
+    });
 }
 
-// ✅ Make sure DB is connected before every request
-app.use(async (req, res, next) => {
-  try {
-    await ensureMongo();
-    next();
-  } catch (e) {
-    res.status(500).json({ error: "DB connection failed", details: String(e) });
-  }
-});
-
-// ✅ STEP 2: VERCEL SERVERLESS EXPORT (no app.listen on Vercel)
-const port = Number(process.env.PORT || 8080);
-if (!process.env.VERCEL) {
-  app.listen(port, () => console.log(`API running on :${port}`));
+// Vercel: serverless handler
+export default async function handler(req, res) {
+  await connectDb();
+  return app(req, res);
 }
-
-export default app;
